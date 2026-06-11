@@ -164,11 +164,17 @@ function flush(): void {
   const url = (options.endpoint ?? "https://app.vaza.ai") + "/api/track"
 
   // Prefer sendBeacon so the request survives navigation; fall back to fetch.
+  // IMPORTANT: blob type must be a "CORS-simple" content type (text/plain,
+  // application/x-www-form-urlencoded, or multipart/form-data). Using
+  // application/json triggers a preflight that sendBeacon cannot perform,
+  // and the browser silently drops the request as a CORS error. The
+  // /api/track route reads `await request.json()` which ignores the
+  // declared Content-Type, so text/plain is safe on the wire.
   try {
     if (navigator.sendBeacon) {
-      const blob = new Blob([payload], { type: "application/json" })
-      navigator.sendBeacon(url, blob)
-      return
+      const blob = new Blob([payload], { type: "text/plain" })
+      const ok = navigator.sendBeacon(url, blob)
+      if (ok) return
     }
   } catch {
     // sendBeacon can throw on some browsers; fall through.
@@ -176,7 +182,10 @@ function flush(): void {
   void fetch(url, {
     method: "POST",
     keepalive: true,
-    headers: { "Content-Type": "application/json" },
+    // Same reasoning: keep this as text/plain to avoid the preflight that
+    // sendBeacon avoided. The server reads the body via request.json()
+    // regardless of the declared Content-Type.
+    headers: { "Content-Type": "text/plain" },
     body: payload,
   }).catch(() => {
     // Silent fail. Telemetry is best-effort.
@@ -364,13 +373,15 @@ async function sendReplayChunk(records: unknown[]): Promise<void> {
     records,
   })
   if (navigator.sendBeacon) {
-    navigator.sendBeacon(url, new Blob([body], { type: "application/json" }))
-    return
+    // Same CORS-simple requirement as flush(). See flush() comment.
+    if (navigator.sendBeacon(url, new Blob([body], { type: "text/plain" }))) {
+      return
+    }
   }
   await fetch(url, {
     method: "POST",
     keepalive: true,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "text/plain" },
     body,
   }).catch(() => {})
 }
