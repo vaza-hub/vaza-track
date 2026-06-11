@@ -82,7 +82,6 @@ const DEAD_CLICK_TIMEOUT_MS = 500
 
 let options: VazaTrackOptions | null = null
 let sessionId = ""
-let lastActivityAt = 0
 let queue: VazaEvent[] = []
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -116,18 +115,24 @@ function getOrCreateSession(): string {
 
 function selectorFor(el: Element): string {
   if (!el || el === document.documentElement) return "html"
-  if (el.id) return `#${el.id}`
+  if (el.id) return `#${el.id}`.slice(0, 200)
   const parts: string[] = []
   let current: Element | null = el
   while (current && current !== document.documentElement && parts.length < 4) {
     let part = current.tagName.toLowerCase()
     if (current.classList.length > 0) {
-      part += "." + Array.from(current.classList).slice(0, 2).join(".")
+      // Cap class names to avoid runaway selectors on Tailwind-heavy markup.
+      part +=
+        "." +
+        Array.from(current.classList)
+          .slice(0, 2)
+          .map((c) => c.slice(0, 40))
+          .join(".")
     }
     parts.unshift(part)
     current = current.parentElement
   }
-  return parts.join(">")
+  return parts.join(">").slice(0, 200)
 }
 
 function enqueue(event: VazaEvent): void {
@@ -146,7 +151,15 @@ function flush(): void {
   flushTimer = null
   if (!options || queue.length === 0) return
 
-  const payload = JSON.stringify({ key: options.key, events: queue })
+  // Custom payloads can contain circular refs (e.g. React fiber objects).
+  // Bail gracefully instead of throwing into the caller's app.
+  let payload: string
+  try {
+    payload = JSON.stringify({ key: options.key, events: queue })
+  } catch {
+    queue = []
+    return
+  }
   queue = []
   const url = (options.endpoint ?? "https://app.vaza.ai") + "/api/track"
 
@@ -315,13 +328,16 @@ async function lazyLoadReplay(): Promise<void> {
   if (!options?.replay) return
   if (Math.random() > (options.replaySampleRate ?? 0.1)) return
   try {
-    // Dynamic import keeps rrweb out of the base bundle.
-    const { record } = await import(
-      /* @vite-ignore */ "https://cdn.jsdelivr.net/npm/rrweb@2.0.0-alpha.4/+esm"
-    )
+    // Dynamic import keeps rrweb out of the base bundle. We load it via a
+    // runtime-only URL string so tsc doesn't try to resolve types.
+    const rrwebUrl = "https://cdn.jsdelivr.net/npm/rrweb@2.0.0-alpha.4/+esm"
+    const mod = (await import(/* @vite-ignore */ rrwebUrl)) as {
+      record: (opts: unknown) => void
+    }
+    const { record } = mod
     const chunks: unknown[] = []
     let lastSend = Date.now()
-    ;(record as unknown as (opts: unknown) => void)({
+    record({
       emit(rec: unknown) {
         chunks.push(rec)
         // Batch every 5 seconds.
@@ -363,7 +379,6 @@ function init(opts: VazaTrackOptions): void {
   if (options) return // already initialized
   options = opts
   sessionId = getOrCreateSession()
-  lastActivityAt = Date.now()
   setupFlushTriggers()
   if (!opts.manual) {
     captureErrors()
