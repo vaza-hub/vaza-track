@@ -76,6 +76,37 @@ interface VisibilityEventPayload extends BaseEvent {
   state: "hidden" | "visible"
 }
 
+interface FormSubmitEventPayload extends BaseEvent {
+  type: "form_submit"
+  selector: string
+  payload: { field_count: number; form_id: string }
+}
+
+interface InputEventPayload extends BaseEvent {
+  type: "input"
+  selector: string
+  payload: { field_type: string; field_name?: string }
+}
+
+interface NetworkErrorEventPayload extends BaseEvent {
+  type: "network_error"
+  payload: {
+    target_url: string
+    method: string
+    status: number
+    duration_ms: number
+  }
+}
+
+interface WebVitalEventPayload extends BaseEvent {
+  type: "web_vital"
+  payload: {
+    metric: "LCP" | "INP" | "CLS"
+    value: number
+    rating: "good" | "needs-improvement" | "poor"
+  }
+}
+
 type VazaEvent =
   | ErrorEventPayload
   | ClickEventPayload
@@ -83,6 +114,10 @@ type VazaEvent =
   | CustomEventPayload
   | ScrollEventPayload
   | VisibilityEventPayload
+  | FormSubmitEventPayload
+  | InputEventPayload
+  | NetworkErrorEventPayload
+  | WebVitalEventPayload
 
 const SESSION_KEY = "vz_sid"
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000 // 30 min idle = new session
@@ -316,6 +351,219 @@ function captureClicks(): void {
   )
 }
 
+/** Sanitize URL — drop query string + fragment, cap length. We don't want
+ *  PII or auth tokens accidentally leaking through network-error reports. */
+function sanitizeUrl(input: string): string {
+  try {
+    const u = new URL(input, location.origin)
+    return `${u.origin}${u.pathname}`.slice(0, 240)
+  } catch {
+    return input.split("?")[0].split("#")[0].slice(0, 240)
+  }
+}
+
+function captureFormsAndInputs(): void {
+  // Form submits — capture at the document level so SPAs that intercept
+  // submit still fire here as long as the form-level event bubbles.
+  document.addEventListener(
+    "submit",
+    (e) => {
+      const form = e.target as HTMLFormElement | null
+      if (!form || form.tagName !== "FORM") return
+      enqueue({
+        type: "form_submit",
+        url: location.href,
+        ts: Date.now(),
+        session_id: sessionId,
+        selector: selectorFor(form),
+        payload: {
+          field_count: form.elements?.length ?? 0,
+          form_id: (form.id || form.getAttribute("name") || "").slice(0, 60),
+        },
+      })
+    },
+    true,
+  )
+
+  // Field focus — captures intent (user engaged with a field) without
+  // ever reading the value. Useful for funnel/form abandonment detection.
+  document.addEventListener(
+    "focus",
+    (e) => {
+      const el = e.target as HTMLElement | null
+      if (!el) return
+      const tag = el.tagName.toLowerCase()
+      if (tag !== "input" && tag !== "textarea" && tag !== "select") return
+      const fieldType =
+        tag === "input"
+          ? (el as HTMLInputElement).type.slice(0, 24) || "text"
+          : tag
+      // Skip password fields entirely — never even capture the focus event,
+      // to keep the data clean of any inference about password length, etc.
+      if (fieldType === "password") return
+      const name =
+        (el.getAttribute("name") || el.id || "").slice(0, 40) || undefined
+      enqueue({
+        type: "input",
+        url: location.href,
+        ts: Date.now(),
+        session_id: sessionId,
+        selector: selectorFor(el),
+        payload: { field_type: fieldType, field_name: name },
+      })
+    },
+    true,
+  )
+}
+
+function captureNetworkErrors(): void {
+  // Wrap fetch. We never capture request bodies or response bodies; only
+  // status, URL path, method, duration.
+  if (typeof window.fetch === "function") {
+    const orig = window.fetch.bind(window)
+    window.fetch = async function (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> {
+      const start = Date.now()
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      const method = (init?.method || "GET").toUpperCase()
+      try {
+        const res = await orig(input, init)
+        if (res.status >= 400) {
+          enqueue({
+            type: "network_error",
+            url: location.href,
+            ts: Date.now(),
+            session_id: sessionId,
+            payload: {
+              target_url: sanitizeUrl(url),
+              method,
+              status: res.status,
+              duration_ms: Date.now() - start,
+            },
+          })
+        }
+        return res
+      } catch (err) {
+        enqueue({
+          type: "network_error",
+          url: location.href,
+          ts: Date.now(),
+          session_id: sessionId,
+          payload: {
+            target_url: sanitizeUrl(url),
+            method,
+            status: 0, // network-level failure
+            duration_ms: Date.now() - start,
+          },
+        })
+        throw err
+      }
+    }
+  }
+}
+
+/** Inline Core Web Vitals capture via PerformanceObserver — no extra
+ *  dependency. Mirrors the thresholds from web.dev: LCP ≤ 2.5s good,
+ *  INP ≤ 200ms good, CLS ≤ 0.1 good. Reported on visibility hidden /
+ *  pagehide so we emit the final value, not intermediate states. */
+function captureWebVitals(): void {
+  if (typeof PerformanceObserver === "undefined") return
+
+  let lcpValue = 0
+  let inpValue = 0
+  let clsValue = 0
+
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const e = entry as PerformanceEntry & {
+          renderTime?: number
+          loadTime?: number
+        }
+        lcpValue = e.renderTime || e.loadTime || e.startTime
+      }
+    }).observe({ type: "largest-contentful-paint", buffered: true })
+  } catch {}
+
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const e = entry as PerformanceEntry & {
+          hadRecentInput?: boolean
+          value?: number
+        }
+        if (!e.hadRecentInput) clsValue += e.value ?? 0
+      }
+    }).observe({ type: "layout-shift", buffered: true })
+  } catch {}
+
+  // INP — modern browsers expose "event" entries with durations.
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const dur = entry.duration
+        if (dur > inpValue) inpValue = dur
+      }
+    }).observe({
+      type: "event",
+      // @ts-expect-error: durationThreshold is widely supported but not in core lib types yet
+      durationThreshold: 16,
+      buffered: true,
+    })
+  } catch {}
+
+  function ratingFor(
+    metric: "LCP" | "INP" | "CLS",
+    value: number,
+  ): "good" | "needs-improvement" | "poor" {
+    if (metric === "LCP") {
+      return value <= 2500 ? "good" : value <= 4000 ? "needs-improvement" : "poor"
+    }
+    if (metric === "INP") {
+      return value <= 200 ? "good" : value <= 500 ? "needs-improvement" : "poor"
+    }
+    // CLS is unitless 0..n, threshold 0.1 good / 0.25 poor.
+    return value <= 0.1 ? "good" : value <= 0.25 ? "needs-improvement" : "poor"
+  }
+
+  function emit(metric: "LCP" | "INP" | "CLS", value: number) {
+    if (value <= 0) return
+    enqueue({
+      type: "web_vital",
+      url: location.href,
+      ts: Date.now(),
+      session_id: sessionId,
+      payload: {
+        metric,
+        // round LCP/INP to integer ms; keep CLS at 3 decimals
+        value: metric === "CLS" ? Math.round(value * 1000) / 1000 : Math.round(value),
+        rating: ratingFor(metric, value),
+      },
+    })
+  }
+
+  let reported = false
+  function reportAll() {
+    if (reported) return
+    reported = true
+    emit("LCP", lcpValue)
+    emit("INP", inpValue)
+    emit("CLS", clsValue)
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") reportAll()
+  })
+  window.addEventListener("pagehide", reportAll)
+}
+
 function captureScrollAndVisibility(): void {
   // Track max scroll depth per pageview. Emit once on pagehide / visibility
   // hidden so we don't spam events while the user scrolls.
@@ -416,6 +664,9 @@ function init(opts: VazaTrackOptions): void {
     captureClicks()
     capturePageviews()
     captureScrollAndVisibility()
+    captureFormsAndInputs()
+    captureNetworkErrors()
+    captureWebVitals()
   }
 }
 
