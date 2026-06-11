@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vaza-track basic example</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 640px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #111;
+      }
+      button {
+        background: #2563eb;
+        color: white;
+        border: 0;
+        border-radius: 8px;
+        padding: 0.75rem 1.25rem;
+        font-size: 1rem;
+        cursor: pointer;
+        margin: 0.5rem 0.5rem 0.5rem 0;
+      }
+      pre {
+        background: #f3f4f6;
+        padding: 1rem;
+        border-radius: 8px;
+        overflow-x: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>vaza-track basic example</h1>
+    <p>
+      Open DevTools Network tab and filter by <code>track</code>. Click the
+      buttons below to fire different events.
+    </p>
+
+    <button id="error-btn">Throw an error</button>
+    <button id="rage-btn">Click me fast 4 times (rage)</button>
+    <button id="custom-btn">Track custom event</button>
+
+    <h3>Span without click handler (dead click target)</h3>
+    <span id="dead-span" style="display: inline-block; padding: 1rem; background: #fde68a; border-radius: 6px; cursor: pointer">
+      Click me, nothing will happen
+    </span>
+
+    <pre id="log">Events will be logged here.</pre>
+
+    <script type="module">
+      // In production: import vaza from "@vaza/track"
+      // For this example, point at the local build.
+      import vaza from "../dist/vaza-track.mjs"
+
+      const log = document.getElementById("log")
+      vaza.init({
+        key: "demo-key",
+        endpoint: "http://localhost:3000", // your vaza-app dev server
+        onError: (e) => appendLog("error", e),
+      })
+
+      function appendLog(label, payload) {
+        log.textContent += "\n" + label + ": " + JSON.stringify(payload, null, 2)
+      }
+
+      document.getElementById("error-btn").addEventListener("click", () => {
+        // Synchronous throw triggers window.onerror.
+        throw new Error("demo: intentional error from button click")
+      })
+
+      document.getElementById("custom-btn").addEventListener("click", () => {
+        vaza.track("demo_custom_event", { from: "basic.html" })
+        appendLog("custom_emitted", { name: "demo_custom_event" })
+      })
+    </script>
+  </body>
+</html>

@@ -1,0 +1,50 @@
+{
+  "name": "@vaza/track",
+  "version": "0.1.0",
+  "description": "Autonomous-fix telemetry SDK for vaza.ai. Captures errors, rage clicks, dead clicks, and custom events. CDN already handles Core Web Vitals.",
+  "type": "module",
+  "main": "./dist/vaza-track.cjs",
+  "module": "./dist/vaza-track.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/vaza-track.mjs",
+      "require": "./dist/vaza-track.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs,iife --global-name vaza --minify --dts --clean",
+    "dev": "tsup src/index.ts --format esm --watch",
+    "check": "tsc --noEmit",
+    "test:size": "npm run build && ls -lh dist/"
+  },
+  "keywords": [
+    "vaza",
+    "telemetry",
+    "rum",
+    "errors",
+    "rage-click",
+    "session-replay",
+    "seo",
+    "aeo",
+    "autonomous-fix"
+  ],
+  "author": "vaza.ai <hello@vaza.ai>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vaza-hub/vaza-track.git"
+  },
+  "homepage": "https://vaza.ai",
+  "devDependencies": {
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0"
+  }
+}
