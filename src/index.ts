@@ -24,10 +24,6 @@ interface VazaTrackOptions {
   endpoint?: string
   /** Disable any automatic captures. Custom events still work. */
   manual?: boolean
-  /** Enable rrweb session replay (lazy loaded). */
-  replay?: boolean
-  /** Replay sample rate, 0..1. Defaults to 0.1 (10%). */
-  replaySampleRate?: number
   /** Forward errors to a custom handler in addition to vaza. */
   onError?: (error: ErrorEventPayload) => void
 }
@@ -51,10 +47,12 @@ interface ErrorEventPayload extends BaseEvent {
 }
 
 interface ClickEventPayload extends BaseEvent {
-  type: "rage_click" | "dead_click"
+  type: "click" | "rage_click" | "dead_click"
   selector: string
   text?: string
   count?: number
+  coord_x?: number
+  coord_y?: number
 }
 
 interface PageviewEventPayload extends BaseEvent {
@@ -68,11 +66,23 @@ interface CustomEventPayload extends BaseEvent {
   name: string
 }
 
+interface ScrollEventPayload extends BaseEvent {
+  type: "scroll"
+  scroll_max_y: number
+}
+
+interface VisibilityEventPayload extends BaseEvent {
+  type: "visibility"
+  state: "hidden" | "visible"
+}
+
 type VazaEvent =
   | ErrorEventPayload
   | ClickEventPayload
   | PageviewEventPayload
   | CustomEventPayload
+  | ScrollEventPayload
+  | VisibilityEventPayload
 
 const SESSION_KEY = "vz_sid"
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000 // 30 min idle = new session
@@ -239,9 +249,24 @@ function captureClicks(): void {
       const target = e.target as Element | null
       if (!target) return
       const selector = selectorFor(target)
+      const text = (target.textContent || "").slice(0, 60)
       const now = Date.now()
+      const x = (e as MouseEvent).clientX | 0
+      const y = (e as MouseEvent).clientY | 0
 
-      // Rage click detection.
+      // Always emit a generic click. Powers heatmaps + funnel analysis.
+      enqueue({
+        type: "click",
+        url: location.href,
+        ts: now,
+        session_id: sessionId,
+        selector,
+        text,
+        coord_x: x,
+        coord_y: y,
+      })
+
+      // Rage click detection (additive — generic click already fired).
       const entry = recent.find((r) => r.selector === selector)
       if (entry) {
         entry.times = entry.times.filter((t) => now - t < RAGE_CLICK_WINDOW_MS)
@@ -253,10 +278,12 @@ function captureClicks(): void {
             ts: now,
             session_id: sessionId,
             selector,
-            text: (target.textContent || "").slice(0, 60),
+            text,
             count: entry.times.length,
+            coord_x: x,
+            coord_y: y,
           })
-          entry.times = [] // Reset to avoid spamming.
+          entry.times = []
         }
       } else {
         recent.push({ selector, times: [now] })
@@ -278,13 +305,59 @@ function captureClicks(): void {
             ts: now,
             session_id: sessionId,
             selector,
-            text: (target.textContent || "").slice(0, 60),
+            text,
+            coord_x: x,
+            coord_y: y,
           })
         }
       }, DEAD_CLICK_TIMEOUT_MS)
     },
     { passive: true },
   )
+}
+
+function captureScrollAndVisibility(): void {
+  // Track max scroll depth per pageview. Emit once on pagehide / visibility
+  // hidden so we don't spam events while the user scrolls.
+  let maxY = 0
+  window.addEventListener(
+    "scroll",
+    () => {
+      const y = window.scrollY | 0
+      if (y > maxY) maxY = y
+    },
+    { passive: true },
+  )
+
+  function flushScroll() {
+    if (maxY > 0) {
+      enqueue({
+        type: "scroll",
+        url: location.href,
+        ts: Date.now(),
+        session_id: sessionId,
+        scroll_max_y: maxY,
+      })
+      maxY = 0
+    }
+  }
+
+  // Visibility: signals tab switch / page leave. Useful for session boundary
+  // detection — "user bounced 4 seconds after the JS error fired".
+  document.addEventListener("visibilitychange", () => {
+    const state = document.visibilityState === "hidden" ? "hidden" : "visible"
+    enqueue({
+      type: "visibility",
+      url: location.href,
+      ts: Date.now(),
+      session_id: sessionId,
+      state,
+    })
+    if (state === "hidden") flushScroll()
+  })
+  window.addEventListener("pagehide", () => {
+    flushScroll()
+  })
 }
 
 function isInteractive(el: Element): boolean {
@@ -333,59 +406,6 @@ function setupFlushTriggers(): void {
   window.addEventListener("pagehide", () => flush())
 }
 
-async function lazyLoadReplay(): Promise<void> {
-  if (!options?.replay) return
-  if (Math.random() > (options.replaySampleRate ?? 0.1)) return
-  try {
-    // Dynamic import keeps rrweb out of the base bundle. We load it via a
-    // runtime-only URL string so tsc doesn't try to resolve types.
-    const rrwebUrl = "https://cdn.jsdelivr.net/npm/rrweb@2.0.0-alpha.4/+esm"
-    const mod = (await import(/* @vite-ignore */ rrwebUrl)) as {
-      record: (opts: unknown) => void
-    }
-    const { record } = mod
-    const chunks: unknown[] = []
-    let lastSend = Date.now()
-    record({
-      emit(rec: unknown) {
-        chunks.push(rec)
-        // Batch every 5 seconds.
-        if (Date.now() - lastSend > 5000) {
-          void sendReplayChunk(chunks.splice(0))
-          lastSend = Date.now()
-        }
-      },
-    })
-    window.addEventListener("pagehide", () => {
-      if (chunks.length > 0) void sendReplayChunk(chunks.splice(0))
-    })
-  } catch {
-    // Replay failed to load. Telemetry still works.
-  }
-}
-
-async function sendReplayChunk(records: unknown[]): Promise<void> {
-  if (!options || records.length === 0) return
-  const url = (options.endpoint ?? "https://app.vaza.ai") + "/api/track-replay"
-  const body = JSON.stringify({
-    key: options.key,
-    session_id: sessionId,
-    records,
-  })
-  if (navigator.sendBeacon) {
-    // Same CORS-simple requirement as flush(). See flush() comment.
-    if (navigator.sendBeacon(url, new Blob([body], { type: "text/plain" }))) {
-      return
-    }
-  }
-  await fetch(url, {
-    method: "POST",
-    keepalive: true,
-    headers: { "Content-Type": "text/plain" },
-    body,
-  }).catch(() => {})
-}
-
 function init(opts: VazaTrackOptions): void {
   if (options) return // already initialized
   options = opts
@@ -395,8 +415,8 @@ function init(opts: VazaTrackOptions): void {
     captureErrors()
     captureClicks()
     capturePageviews()
+    captureScrollAndVisibility()
   }
-  void lazyLoadReplay()
 }
 
 function track(name: string, payload: Record<string, unknown> = {}): void {
