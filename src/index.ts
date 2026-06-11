@@ -301,6 +301,21 @@ function captureClicks(): void {
         coord_y: y,
       })
 
+      // GA4-style semantic event if the element (or an ancestor) is
+      // annotated with data-vaza-event="some_name". Additive — the
+      // generic click still fires above so heatmaps stay intact.
+      const annotated = findAnnotatedEvent(target)
+      if (annotated) {
+        enqueue({
+          type: "custom",
+          url: location.href,
+          ts: now,
+          session_id: sessionId,
+          name: annotated,
+          payload: { trigger: "click", selector },
+        })
+      }
+
       // Rage click detection (additive — generic click already fired).
       const entry = recent.find((r) => r.selector === selector)
       if (entry) {
@@ -351,6 +366,25 @@ function captureClicks(): void {
   )
 }
 
+/** Walk up the DOM looking for the closest `data-vaza-event` annotation.
+ *  Lets customers opt in to GA4-style semantic event names without any
+ *  extra SDK config: `<button data-vaza-event="signup_clicked">` → we
+ *  emit a `custom` event named "signup_clicked" on top of the automatic
+ *  click capture. Capped at 64 chars to avoid abuse. */
+function findAnnotatedEvent(el: Element | null): string | null {
+  let current: Element | null = el
+  let depth = 0
+  while (current && depth < 6) {
+    if (current instanceof HTMLElement) {
+      const name = current.dataset?.vazaEvent
+      if (name) return String(name).slice(0, 64)
+    }
+    current = current.parentElement
+    depth++
+  }
+  return null
+}
+
 /** Sanitize URL — drop query string + fragment, cap length. We don't want
  *  PII or auth tokens accidentally leaking through network-error reports. */
 function sanitizeUrl(input: string): string {
@@ -381,6 +415,17 @@ function captureFormsAndInputs(): void {
           form_id: (form.id || form.getAttribute("name") || "").slice(0, 60),
         },
       })
+      const annotated = findAnnotatedEvent(form)
+      if (annotated) {
+        enqueue({
+          type: "custom",
+          url: location.href,
+          ts: Date.now(),
+          session_id: sessionId,
+          name: annotated,
+          payload: { trigger: "form_submit", selector: selectorFor(form) },
+        })
+      }
     },
     true,
   )
