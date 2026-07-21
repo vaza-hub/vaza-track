@@ -164,6 +164,8 @@ function selectorFor(el: Element): string {
   const parts: string[] = []
   let current: Element | null = el
   while (current && current !== document.documentElement && parts.length < 4) {
+    // Non-Element nodes (document, text) have no tagName — stop walking.
+    if (typeof current.tagName !== "string") break
     let part = current.tagName.toLowerCase()
     if (current.classList.length > 0) {
       // Cap class names to avoid runaway selectors on Tailwind-heavy markup.
@@ -281,7 +283,13 @@ function captureClicks(): void {
   document.addEventListener(
     "click",
     (e) => {
-      const target = e.target as Element | null
+      // e.target can be a Text node (Safari) or the document itself —
+      // resolve to the nearest Element or drop the event.
+      const raw = e.target as EventTarget | null
+      const target =
+        raw instanceof Element
+          ? raw
+          : ((raw as Node | null)?.parentElement ?? null)
       if (!target) return
       const selector = selectorFor(target)
       const text = (target.textContent || "").slice(0, 60)
@@ -436,7 +444,9 @@ function captureFormsAndInputs(): void {
     "focus",
     (e) => {
       const el = e.target as HTMLElement | null
-      if (!el) return
+      // Focus can fire with document (not an Element) as target when the
+      // tab itself regains focus — no tagName there.
+      if (!el || typeof el.tagName !== "string") return
       const tag = el.tagName.toLowerCase()
       if (tag !== "input" && tag !== "textarea" && tag !== "select") return
       const fieldType =
@@ -654,6 +664,7 @@ function captureScrollAndVisibility(): void {
 }
 
 function isInteractive(el: Element): boolean {
+  if (typeof el.tagName !== "string") return false
   const tag = el.tagName.toLowerCase()
   if (["a", "button", "input", "select", "textarea", "label"].includes(tag))
     return true
