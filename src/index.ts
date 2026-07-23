@@ -107,6 +107,21 @@ interface WebVitalEventPayload extends BaseEvent {
   }
 }
 
+/** Derived signal: the visitor engaged with a form's fields but left the
+ *  page without submitting it. Never carries field values. */
+interface FormAbandonEventPayload extends BaseEvent {
+  type: "form_abandon"
+  selector: string
+  payload: { fields_touched: number; last_field?: string; form_id?: string }
+}
+
+/** Derived signal: the visitor left within seconds of landing without any
+ *  meaningful interaction — the classic pogo-stick bounce. */
+interface QuickBackEventPayload extends BaseEvent {
+  type: "quick_back"
+  payload: { seconds_on_page: number }
+}
+
 type VazaEvent =
   | ErrorEventPayload
   | ClickEventPayload
@@ -118,6 +133,8 @@ type VazaEvent =
   | InputEventPayload
   | NetworkErrorEventPayload
   | WebVitalEventPayload
+  | FormAbandonEventPayload
+  | QuickBackEventPayload
 
 const SESSION_KEY = "vz_sid"
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000 // 30 min idle = new session
@@ -405,6 +422,36 @@ function sanitizeUrl(input: string): string {
 }
 
 function captureFormsAndInputs(): void {
+  // Per-form engagement registry for form_abandon: which forms had field
+  // focus this page-load and were never submitted. Keyed by the form's
+  // selector; values only ever hold field NAMES, never values.
+  const engagedForms = new Map<
+    string,
+    { fieldsTouched: Set<string>; lastField?: string; formId?: string }
+  >()
+
+  function flushFormAbandons() {
+    for (const [selector, info] of engagedForms) {
+      enqueue({
+        type: "form_abandon",
+        url: location.href,
+        ts: Date.now(),
+        session_id: sessionId,
+        selector,
+        payload: {
+          fields_touched: info.fieldsTouched.size,
+          last_field: info.lastField,
+          form_id: info.formId,
+        },
+      })
+    }
+    engagedForms.clear()
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushFormAbandons()
+  })
+  window.addEventListener("pagehide", flushFormAbandons)
+
   // Form submits — capture at the document level so SPAs that intercept
   // submit still fire here as long as the form-level event bubbles.
   document.addEventListener(
@@ -412,6 +459,8 @@ function captureFormsAndInputs(): void {
     (e) => {
       const form = e.target as HTMLFormElement | null
       if (!form || form.tagName !== "FORM") return
+      // A submitted form was not abandoned.
+      engagedForms.delete(selectorFor(form))
       enqueue({
         type: "form_submit",
         url: location.href,
@@ -458,6 +507,17 @@ function captureFormsAndInputs(): void {
       if (fieldType === "password") return
       const name =
         (el.getAttribute("name") || el.id || "").slice(0, 40) || undefined
+      // Record engagement on the owning form for abandonment detection.
+      const owningForm = (el as HTMLInputElement).form
+      if (owningForm) {
+        const key = selectorFor(owningForm)
+        const info = engagedForms.get(key) ?? { fieldsTouched: new Set<string>() }
+        info.fieldsTouched.add(name ?? fieldType)
+        info.lastField = name ?? fieldType
+        info.formId =
+          (owningForm.id || owningForm.getAttribute("name") || "").slice(0, 60) || undefined
+        engagedForms.set(key, info)
+      }
       enqueue({
         type: "input",
         url: location.href,
@@ -469,6 +529,42 @@ function captureFormsAndInputs(): void {
     },
     true,
   )
+}
+
+/** Emit quick_back when the visitor leaves within seconds of landing
+ *  without any meaningful interaction (click, field focus, real scroll).
+ *  One derived event per page load, only on actual page exit — tab
+ *  switches (visibility) don't count as leaving. */
+function captureQuickBack(): void {
+  const QUICK_BACK_MS = 10_000
+  const landedAt = Date.now()
+  let interacted = false
+  let emitted = false
+  const markInteracted = () => {
+    interacted = true
+  }
+  document.addEventListener("click", markInteracted, true)
+  document.addEventListener("focusin", markInteracted, true)
+  window.addEventListener(
+    "scroll",
+    () => {
+      if ((window.scrollY | 0) > 200) interacted = true
+    },
+    { passive: true },
+  )
+  window.addEventListener("pagehide", () => {
+    if (emitted || interacted) return
+    const elapsed = Date.now() - landedAt
+    if (elapsed >= QUICK_BACK_MS) return
+    emitted = true
+    enqueue({
+      type: "quick_back",
+      url: location.href,
+      ts: Date.now(),
+      session_id: sessionId,
+      payload: { seconds_on_page: Math.round(elapsed / 1000) },
+    })
+  })
 }
 
 function captureNetworkErrors(): void {
@@ -640,6 +736,15 @@ function captureScrollAndVisibility(): void {
         ts: Date.now(),
         session_id: sessionId,
         scroll_max_y: maxY,
+        // Page + viewport height turn the raw pixel value into a depth
+        // percentage server-side (scroll-depth distribution per page).
+        payload: {
+          doc_height: Math.max(
+            document.documentElement?.scrollHeight | 0,
+            document.body?.scrollHeight | 0,
+          ),
+          viewport_h: window.innerHeight | 0,
+        },
       })
       maxY = 0
     }
@@ -723,6 +828,7 @@ function init(opts: VazaTrackOptions): void {
     captureFormsAndInputs()
     captureNetworkErrors()
     captureWebVitals()
+    captureQuickBack()
   }
 }
 
