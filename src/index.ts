@@ -845,13 +845,67 @@ function track(name: string, payload: Record<string, unknown> = {}): void {
 }
 
 // Public API exposed on window for `<script>` integration.
+// ── Git-native A/B experiments ─────────────────────────────────────────
+// The site's own code asks which variant this visitor should see; the
+// assignment is a sticky per-device coin flip, and every ask records ONE
+// exposure event per experiment per session so the analyzer can compare
+// conversion between buckets. No external service, no DOM rewriting —
+// both variants are real code in the customer's repo.
+
+const AB_SEED_KEY = "vz_ab_seed"
+const exposureSent = new Set<string>()
+
+function abSeed(): number {
+  try {
+    const existing = localStorage.getItem(AB_SEED_KEY)
+    if (existing !== null) {
+      const n = Number(existing)
+      if (Number.isInteger(n) && n >= 0) return n
+    }
+    const fresh = Math.floor(Math.random() * 1_000_000)
+    localStorage.setItem(AB_SEED_KEY, String(fresh))
+    return fresh
+  } catch {
+    // Storage unavailable (private mode) — stable within this page load.
+    return 0
+  }
+}
+
+/**
+ * Deterministic variant for this visitor + experiment. Stable across
+ * pages and sessions on the same device; independent across experiments.
+ * `shareB` is the percentage of visitors who see "B" (default 50).
+ */
+function variant(experimentKey: string, shareB = 50): "A" | "B" {
+  let h = 5381
+  const s = `${abSeed()}:${experimentKey}`
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 33) ^ s.charCodeAt(i)
+  }
+  const bucket = (h >>> 0) % 100
+  const v: "A" | "B" = bucket < shareB ? "B" : "A"
+  if (options && !exposureSent.has(experimentKey)) {
+    exposureSent.add(experimentKey)
+    enqueue({
+      type: "custom",
+      url: location.href,
+      ts: Date.now(),
+      session_id: sessionId,
+      name: "vz_exposure",
+      payload: { experiment: experimentKey.slice(0, 80), variant: v },
+    })
+  }
+  return v
+}
+
 interface VazaTrackGlobal {
   init: typeof init
   track: typeof track
   flush: typeof flush
+  variant: typeof variant
 }
 
-const vaza: VazaTrackGlobal = { init, track, flush }
+const vaza: VazaTrackGlobal = { init, track, flush, variant }
 
 declare global {
   interface Window {
@@ -864,5 +918,5 @@ if (typeof window !== "undefined") {
 }
 
 export default vaza
-export { init, track, flush }
+export { init, track, flush, variant }
 export type { VazaTrackOptions, VazaEvent }
