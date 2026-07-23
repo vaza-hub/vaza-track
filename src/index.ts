@@ -199,7 +199,12 @@ function selectorFor(el: Element): string {
   return parts.join(">").slice(0, 200)
 }
 
+const FRUSTRATION_TYPES = new Set(["error", "rage_click", "dead_click", "form_abandon"])
+
 function enqueue(event: VazaEvent): void {
+  // Frustration is the replay trigger: the rolling buffer only ever
+  // leaves the browser when a visitor actually struggled.
+  if (FRUSTRATION_TYPES.has(event.type)) replayOnFrustration()
   queue.push(event)
   // Cap queue at 200 to avoid memory blowups on broken pages.
   if (queue.length > 200) queue = queue.slice(-200)
@@ -829,6 +834,7 @@ function init(opts: VazaTrackOptions): void {
     captureNetworkErrors()
     captureWebVitals()
     captureQuickBack()
+    startReplayIfEnabled()
   }
 }
 
@@ -845,6 +851,106 @@ function track(name: string, payload: Record<string, unknown> = {}): void {
 }
 
 // Public API exposed on window for `<script>` integration.
+// ── Sampled session replay (rrweb, AI-only consumer) ───────────────────
+// Dormant unless the workspace enabled replay (checked once via a tiny
+// config fetch). When on: lazy-load the record-only rrweb bundle from
+// the same origin as the tracker, keep a rolling in-memory buffer with
+// inputs ALWAYS masked, and upload only when a frustration event fires
+// (error / rage click / dead click / form abandon) — storage scales
+// with problems, not traffic. Max 2 uploads per session, 800KB cap.
+
+const REPLAY_BUFFER_MS = 30_000
+const REPLAY_MAX_UPLOADS = 2
+const REPLAY_MAX_BYTES = 800_000
+
+interface RrwebEvent {
+	type: number
+	timestamp: number
+	data: unknown
+}
+
+let replayBuffer: RrwebEvent[] = []
+let replayActive = false
+let replayUploads = 0
+
+function pruneReplayBuffer(): void {
+	const cutoff = Date.now() - REPLAY_BUFFER_MS
+	// Keep everything since the last full snapshot older than the cutoff so
+	// the replay can always be reconstructed (type 2 = FullSnapshot).
+	let snapIdx = 0
+	for (let i = replayBuffer.length - 1; i >= 0; i--) {
+		if (replayBuffer[i].type === 2 && replayBuffer[i].timestamp <= cutoff) {
+			snapIdx = i
+			break
+		}
+	}
+	if (snapIdx > 0) replayBuffer = replayBuffer.slice(snapIdx)
+}
+
+function uploadReplay(): void {
+	if (!options || !replayActive || replayUploads >= REPLAY_MAX_UPLOADS) return
+	if (replayBuffer.length < 2) return
+	let body: string
+	try {
+		body = JSON.stringify({
+			key: options.key,
+			session_id: sessionId,
+			events: replayBuffer,
+		})
+	} catch {
+		return
+	}
+	if (body.length > REPLAY_MAX_BYTES) return
+	replayUploads++
+	const url = (options.endpoint ?? "https://app.vaza.ai") + "/api/track/replay"
+	void fetch(url, {
+		method: "POST",
+		keepalive: true,
+		headers: { "Content-Type": "text/plain" },
+		body,
+	}).catch(() => {})
+}
+
+/** Called by the frustration capture paths when replay is live. */
+function replayOnFrustration(): void {
+	if (!replayActive) return
+	// Small tail so the AI sees the aftermath, then ship the buffer.
+	setTimeout(uploadReplay, 3_000)
+}
+
+function startReplayIfEnabled(): void {
+	if (!options) return
+	const base = options.endpoint ?? "https://app.vaza.ai"
+	// One tiny config fetch decides whether to load anything at all.
+	void fetch(`${base}/api/track/config?key=${encodeURIComponent(options.key)}`)
+		.then((r) => (r.ok ? r.json() : null))
+		.then((cfg: { replay?: boolean } | null) => {
+			if (!cfg?.replay) return
+			const s = document.createElement("script")
+			s.src = `${base}/rrweb-record.js`
+			s.async = true
+			s.onload = () => {
+				const rec = (window as unknown as { rrwebRecord?: (o: unknown) => unknown })
+					.rrwebRecord
+				if (typeof rec !== "function") return
+				replayActive = true
+				rec({
+					emit: (ev: RrwebEvent) => {
+						replayBuffer.push(ev)
+						if (replayBuffer.length % 50 === 0) pruneReplayBuffer()
+					},
+					// Non-negotiable: what people type never leaves the browser.
+					maskAllInputs: true,
+					// Periodic full snapshots so a rolling buffer stays playable.
+					checkoutEveryNms: REPLAY_BUFFER_MS,
+					sampling: { mousemove: false, scroll: 250, media: 800 },
+				})
+			}
+			document.head.appendChild(s)
+		})
+		.catch(() => {})
+}
+
 // ── Git-native A/B experiments ─────────────────────────────────────────
 // The site's own code asks which variant this visitor should see; the
 // assignment is a sticky per-device coin flip, and every ask records ONE
