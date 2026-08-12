@@ -23,7 +23,8 @@
     "build": "tsup src/index.ts --format esm,cjs,iife --global-name vaza --minify --dts --clean",
     "dev": "tsup src/index.ts --format esm --watch",
     "check": "tsc --noEmit",
-    "test:size": "npm run build && ls -lh dist/"
+    "test:size": "npm run build && ls -lh dist/",
+    "deploy:public": "node scripts/deploy-public.mjs"
   },
   "keywords": [
     "vaza",
