@@ -53,6 +53,10 @@ interface ClickEventPayload extends BaseEvent {
   count?: number
   coord_x?: number
   coord_y?: number
+  /** click/rage/dead carry { time_on_page_ms }; dead_click additionally
+   *  carries { interactive } — true means a real control (button, link,
+   *  role=button…) swallowed the click, the classic broken-CTA signal. */
+  payload?: Record<string, unknown>
 }
 
 interface PageviewEventPayload extends BaseEvent {
@@ -122,6 +126,13 @@ interface QuickBackEventPayload extends BaseEvent {
   payload: { seconds_on_page: number }
 }
 
+/** Derived signal: rapid up-down scrolling — the visitor is hunting for
+ *  something they can't find (Clarity's "excessive scrolling"). */
+interface ScrollThrashEventPayload extends BaseEvent {
+  type: "scroll_thrash"
+  payload: { reversals: number; distance_px: number; time_on_page_ms: number }
+}
+
 type VazaEvent =
   | ErrorEventPayload
   | ClickEventPayload
@@ -135,12 +146,37 @@ type VazaEvent =
   | WebVitalEventPayload
   | FormAbandonEventPayload
   | QuickBackEventPayload
+  | ScrollThrashEventPayload
 
 const SESSION_KEY = "vz_sid"
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000 // 30 min idle = new session
 const RAGE_CLICK_WINDOW_MS = 1000
 const RAGE_CLICK_THRESHOLD = 4
-const DEAD_CLICK_TIMEOUT_MS = 500
+const DEAD_CLICK_TIMEOUT_MS = 600
+
+/** Counts every DOM mutation (childList/attributes/characterData, subtree)
+ *  since load. Dead-click detection snapshots this at click time — any UI
+ *  reaction (spinner, class toggle, modal, React re-render) increments it,
+ *  which the old `document.body.childNodes.length` comparison missed for
+ *  everything but top-level inserts. */
+let domMutations = 0
+
+/** Epoch ms of the current pageview (reset on SPA route change) so click
+ *  events can carry time_on_page_ms — time-to-first-CTA-click and friends
+ *  are conversion metrics the raw `ts` can't give without joining events. */
+let pageLandedAt = Date.now()
+
+function observeDomMutations(): void {
+  if (typeof MutationObserver === "undefined" || !document.documentElement) return
+  new MutationObserver(() => {
+    domMutations++
+  }).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true,
+  })
+}
 
 let options: VazaTrackOptions | null = null
 let sessionId = ""
@@ -199,7 +235,13 @@ function selectorFor(el: Element): string {
   return parts.join(">").slice(0, 200)
 }
 
-const FRUSTRATION_TYPES = new Set(["error", "rage_click", "dead_click", "form_abandon"])
+const FRUSTRATION_TYPES = new Set([
+  "error",
+  "rage_click",
+  "dead_click",
+  "form_abandon",
+  "scroll_thrash",
+])
 
 function enqueue(event: VazaEvent): void {
   // Frustration is the replay trigger: the rolling buffer only ever
@@ -319,6 +361,16 @@ function captureClicks(): void {
       const x = (e as MouseEvent).clientX | 0
       const y = (e as MouseEvent).clientY | 0
 
+      const timeOnPage = now - pageLandedAt
+      // coord_x/coord_y are viewport-relative (legacy shape, kept as-is).
+      // page_y adds the scroll offset so heatmaps can place the click on
+      // the DOCUMENT; viewport_w lets them normalize across devices.
+      const clickContext = {
+        time_on_page_ms: timeOnPage,
+        page_y: (y + (window.scrollY | 0)) | 0,
+        viewport_w: window.innerWidth | 0,
+      }
+
       // Always emit a generic click. Powers heatmaps + funnel analysis.
       enqueue({
         type: "click",
@@ -329,6 +381,7 @@ function captureClicks(): void {
         text,
         coord_x: x,
         coord_y: y,
+        payload: clickContext,
       })
 
       // GA4-style semantic event if the element (or an ancestor) is
@@ -362,6 +415,7 @@ function captureClicks(): void {
             count: entry.times.length,
             coord_x: x,
             coord_y: y,
+            payload: clickContext,
           })
           entry.times = []
         }
@@ -370,27 +424,53 @@ function captureClicks(): void {
         if (recent.length > 20) recent.shift()
       }
 
-      // Dead click detection: schedule a check.
-      const beforeUrl = location.href
-      const beforeMutationCount = document.body.childNodes.length
-      setTimeout(() => {
-        if (
-          location.href === beforeUrl &&
-          document.body.childNodes.length === beforeMutationCount &&
-          !isInteractive(target)
-        ) {
+      // Dead click detection: a click that produced no reaction at all —
+      // no DOM mutation, no navigation, no scroll. Two flavors, told apart
+      // by payload.interactive:
+      //   true  — a real control swallowed the click (broken CTA). The
+      //           conversion killer; the old detector excluded these.
+      //   false — a non-interactive element the visitor EXPECTED to be
+      //           clickable (affordance problem).
+      // Skipped for elements whose click legitimately changes nothing in
+      // the DOM (form controls take focus; labels toggle them) and for
+      // anchors with a real href — navigation is the expected effect and
+      // slow servers would false-positive; SPA-intercepted anchors still
+      // mutate the DOM when they work.
+      const control = interactiveAncestor(target)
+      const anchor = target.closest?.("a")
+      const anchorHref = anchor?.getAttribute("href") ?? ""
+      const navigational =
+        anchorHref !== "" && anchorHref !== "#" && !anchorHref.toLowerCase().startsWith("javascript:")
+      const formControl = /^(input|textarea|select|option|label)$/.test(
+        (control ?? target).tagName.toLowerCase(),
+      )
+      const editable = target instanceof HTMLElement && target.isContentEditable
+      if (!navigational && !formControl && !editable) {
+        const beforeUrl = location.href
+        const beforeMutations = domMutations
+        const beforeScroll = window.scrollY | 0
+        setTimeout(() => {
+          if (location.href !== beforeUrl) return
+          if (domMutations !== beforeMutations) return
+          // The click scrolled the page (in-page nav) or the user moved on.
+          if (Math.abs((window.scrollY | 0) - beforeScroll) > 8) return
+          // Text selection is a deliberate no-effect click, not frustration.
+          try {
+            if (window.getSelection()?.toString()) return
+          } catch {}
           enqueue({
             type: "dead_click",
             url: location.href,
             ts: now,
             session_id: sessionId,
-            selector,
+            selector: control ? selectorFor(control) : selector,
             text,
             coord_x: x,
             coord_y: y,
+            payload: { ...clickContext, interactive: !!control },
           })
-        }
-      }, DEAD_CLICK_TIMEOUT_MS)
+        }, DEAD_CLICK_TIMEOUT_MS)
+      }
     },
     { passive: true },
   )
@@ -724,11 +804,59 @@ function captureScrollAndVisibility(): void {
   // Track max scroll depth per pageview. Emit once on pagehide / visibility
   // hidden so we don't spam events while the user scrolls.
   let maxY = 0
+
+  // Scroll-thrash: count direction reversals in a sliding window. Rapid
+  // up-down-up hunting means the visitor can't find what they came for.
+  // One emit per THRASH_COOLDOWN_MS so a long frustrated session doesn't
+  // flood the queue.
+  const THRASH_WINDOW_MS = 5_000
+  const THRASH_REVERSALS = 3
+  const THRASH_COOLDOWN_MS = 15_000
+  let lastY = window.scrollY | 0
+  let lastDir = 0
+  let moves: { t: number; d: number; reversal: boolean }[] = []
+  let lastThrashAt = 0
+
   window.addEventListener(
     "scroll",
     () => {
       const y = window.scrollY | 0
       if (y > maxY) maxY = y
+
+      const delta = y - lastY
+      lastY = y
+      if (delta === 0) return
+      const now = Date.now()
+      const dir = delta > 0 ? 1 : -1
+      moves.push({ t: now, d: Math.abs(delta), reversal: lastDir !== 0 && dir !== lastDir })
+      lastDir = dir
+      if (moves.length > 400) moves = moves.slice(-200)
+
+      const cutoff = now - THRASH_WINDOW_MS
+      moves = moves.filter((m) => m.t >= cutoff)
+      const reversals = moves.filter((m) => m.reversal).length
+      const distance = moves.reduce((sum, m) => sum + m.d, 0)
+      if (
+        reversals >= THRASH_REVERSALS &&
+        // Require real travel within the window — a tiny wobble (bounce
+        // scrolling, sticky-header jitter) reverses direction without meaning.
+        distance > (window.innerHeight | 0) &&
+        now - lastThrashAt > THRASH_COOLDOWN_MS
+      ) {
+        lastThrashAt = now
+        moves = []
+        enqueue({
+          type: "scroll_thrash",
+          url: location.href,
+          ts: now,
+          session_id: sessionId,
+          payload: {
+            reversals,
+            distance_px: distance | 0,
+            time_on_page_ms: now - pageLandedAt,
+          },
+        })
+      }
     },
     { passive: true },
   )
@@ -783,6 +911,19 @@ function isInteractive(el: Element): boolean {
   return false
 }
 
+/** Clicks land on the <span> inside the <button>. Walk up a few levels so
+ *  the broken control itself is what gets reported, not its inner text. */
+function interactiveAncestor(el: Element): Element | null {
+  let current: Element | null = el
+  let depth = 0
+  while (current && depth < 6) {
+    if (isInteractive(current)) return current
+    current = current.parentElement
+    depth++
+  }
+  return null
+}
+
 function capturePageviews(): void {
   emitPageview(document.referrer)
   // SPA route changes.
@@ -802,6 +943,9 @@ function capturePageviews(): void {
 }
 
 function emitPageview(referrer: string): void {
+  // A route change starts a new page for timing purposes — time_on_page_ms
+  // on clicks is relative to the view the visitor is actually looking at.
+  pageLandedAt = Date.now()
   enqueue({
     type: "pageview",
     url: location.href,
@@ -809,6 +953,14 @@ function emitPageview(referrer: string): void {
     session_id: sessionId,
     referrer,
     title: document.title.slice(0, 120),
+    // Device context for segmentation ("is this CTA dead on mobile only?")
+    // and for normalizing click coordinates into heatmaps across devices.
+    payload: {
+      viewport_w: window.innerWidth | 0,
+      viewport_h: window.innerHeight | 0,
+      screen_w: (screen?.width ?? 0) | 0,
+      dpr: Math.round((window.devicePixelRatio || 1) * 100) / 100,
+    },
   })
 }
 
@@ -827,6 +979,7 @@ function init(opts: VazaTrackOptions): void {
   setupFlushTriggers()
   if (!opts.manual) {
     captureErrors()
+    observeDomMutations()
     captureClicks()
     capturePageviews()
     captureScrollAndVisibility()
