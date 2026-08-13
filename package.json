@@ -1,6 +1,6 @@
 {
   "name": "@vaza/track",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Autonomous-fix telemetry SDK for vaza.ai. Captures errors, rage clicks, dead clicks, and custom events. CDN already handles Core Web Vitals.",
   "type": "module",
   "main": "./dist/vaza-track.cjs",

@@ -83,7 +83,17 @@ interface VisibilityEventPayload extends BaseEvent {
 interface FormSubmitEventPayload extends BaseEvent {
   type: "form_submit"
   selector: string
-  payload: { field_count: number; form_id: string }
+  payload: { field_count: number; form_id: string; src?: string }
+}
+
+/** A form became ≥50% visible — the denominator for per-placement conversion.
+ *  Emitted once per form element per page load. Without it, submit counts
+ *  can't be turned into rates: a sticky-rail form "outperforming" a footer
+ *  form may just be seen ten times as often. */
+interface FormImpressionEventPayload extends BaseEvent {
+  type: "form_impression"
+  selector: string
+  payload: { form_id?: string; src?: string }
 }
 
 interface InputEventPayload extends BaseEvent {
@@ -116,7 +126,7 @@ interface WebVitalEventPayload extends BaseEvent {
 interface FormAbandonEventPayload extends BaseEvent {
   type: "form_abandon"
   selector: string
-  payload: { fields_touched: number; last_field?: string; form_id?: string }
+  payload: { fields_touched: number; last_field?: string; form_id?: string; src?: string }
 }
 
 /** Derived signal: the visitor left within seconds of landing without any
@@ -141,6 +151,7 @@ type VazaEvent =
   | ScrollEventPayload
   | VisibilityEventPayload
   | FormSubmitEventPayload
+  | FormImpressionEventPayload
   | InputEventPayload
   | NetworkErrorEventPayload
   | WebVitalEventPayload
@@ -506,13 +517,67 @@ function sanitizeUrl(input: string): string {
   }
 }
 
+/** Attribution token for a form: data-vaza-src on the form itself or the
+ *  nearest ancestor. The same token the site puts in conversion URLs
+ *  (e.g. "art-rail:blog/some-post"), so impressions, submits and the
+ *  resulting leads all key on one string. */
+function srcFor(form: Element): string | undefined {
+  const holder = form.closest("[data-vaza-src]")
+  const v = holder?.getAttribute("data-vaza-src")
+  return v ? v.slice(0, 80) : undefined
+}
+
+/** form_impression: fires once per form per page load when the form is at
+ *  least half visible. IntersectionObserver so it costs nothing until a
+ *  form actually scrolls into view; a MutationObserver picks up forms that
+ *  SPAs mount after load. */
+function captureFormImpressions(): void {
+  if (typeof IntersectionObserver === "undefined") return
+  const seen = new WeakSet<Element>()
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting || seen.has(entry.target)) continue
+        seen.add(entry.target)
+        io.unobserve(entry.target)
+        const form = entry.target
+        enqueue({
+          type: "form_impression",
+          url: location.href,
+          ts: Date.now(),
+          session_id: sessionId,
+          selector: selectorFor(form),
+          payload: {
+            form_id:
+              (form.id || form.getAttribute("name") || "").slice(0, 60) || undefined,
+            src: srcFor(form),
+          },
+        })
+      }
+    },
+    { threshold: 0.5 },
+  )
+  const observeAll = () => {
+    for (const form of Array.from(document.forms)) {
+      if (!seen.has(form)) io.observe(form)
+    }
+  }
+  observeAll()
+  if (typeof MutationObserver !== "undefined" && document.documentElement) {
+    new MutationObserver(observeAll).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    })
+  }
+}
+
 function captureFormsAndInputs(): void {
   // Per-form engagement registry for form_abandon: which forms had field
   // focus this page-load and were never submitted. Keyed by the form's
   // selector; values only ever hold field NAMES, never values.
   const engagedForms = new Map<
     string,
-    { fieldsTouched: Set<string>; lastField?: string; formId?: string }
+    { fieldsTouched: Set<string>; lastField?: string; formId?: string; src?: string }
   >()
 
   function flushFormAbandons() {
@@ -527,6 +592,7 @@ function captureFormsAndInputs(): void {
           fields_touched: info.fieldsTouched.size,
           last_field: info.lastField,
           form_id: info.formId,
+          src: info.src,
         },
       })
     }
@@ -555,6 +621,7 @@ function captureFormsAndInputs(): void {
         payload: {
           field_count: form.elements?.length ?? 0,
           form_id: (form.id || form.getAttribute("name") || "").slice(0, 60),
+          src: srcFor(form),
         },
       })
       const annotated = findAnnotatedEvent(form)
@@ -601,6 +668,7 @@ function captureFormsAndInputs(): void {
         info.lastField = name ?? fieldType
         info.formId =
           (owningForm.id || owningForm.getAttribute("name") || "").slice(0, 60) || undefined
+        info.src = srcFor(owningForm)
         engagedForms.set(key, info)
       }
       enqueue({
@@ -974,6 +1042,11 @@ function setupFlushTriggers(): void {
 
 function init(opts: VazaTrackOptions): void {
   if (options) return // already initialized
+  // Automation (Playwright, Selenium, headless audits) self-identifies via
+  // navigator.webdriver. Refusing to init keeps synthetic sessions out of
+  // every downstream rate — 38% of the marketing site's sessions were bots,
+  // which dilutes conversion and friction metrics past usefulness.
+  if (typeof navigator !== "undefined" && navigator.webdriver) return
   options = opts
   sessionId = getOrCreateSession()
   setupFlushTriggers()
@@ -984,6 +1057,7 @@ function init(opts: VazaTrackOptions): void {
     capturePageviews()
     captureScrollAndVisibility()
     captureFormsAndInputs()
+    captureFormImpressions()
     captureNetworkErrors()
     captureWebVitals()
     captureQuickBack()
